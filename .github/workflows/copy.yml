@@ -1,0 +1,76 @@
+name: copy
+
+# 通用「目录拷贝」流程: 按 JOBS_JSON 里定义的任务, 把某个源目录整份拷到目标目录。
+#   - 增量 + 幂等: rclone copy 已存在且一致的文件自动跳过, 中断后重跑接着传
+#   - 单轮限时(默认 300m); 跑不完自接力(RELAY_WF=copy.yml)再起一轮
+#   - 防死循环: rclone 报错且本轮零进展 -> 不自接力, 直接失败
+#   - 真实盘名/目录名只存 Secret(公开仓库不落地)
+# Secrets: RCLONE_CONF(含全部相关远端) / JOBS_JSON / GH_TOKEN / TG_TOKEN / TG_CHAT_ID
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "JOBS_JSON 里的任务名"
+        required: true
+        default: "out5-to-gd2"
+      max_duration:
+        description: "本轮最长运行时间(rclone 语法, 如 300m / 4h)"
+        required: false
+        default: "300m"
+      status_only:
+        description: "true=只统计两端进度, 不传输"
+        required: false
+        default: "false"
+      no_relay:
+        description: "true=本轮结束不自接力"
+        required: false
+        default: "false"
+
+concurrency:
+  # 同一个 job 串行; 不同 job 互不影响
+  group: copy-${{ inputs.job || 'default' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  JOBS_JSON: ${{ secrets.JOBS_JSON }}
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  RELAY_WF: copy.yml
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          test -s ~/.config/rclone/rclone.conf && echo "配置已写入"
+          grep -E '^\[' ~/.config/rclone/rclone.conf | sed 's/$/: <masked>/'
+          df -h / | tail -1
+
+      - name: 执行拷贝
+        run: |
+          set -e
+          ARGS="--job ${{ inputs.job }} --max-duration ${{ inputs.max_duration || '300m' }}"
+          if [ "${{ inputs.status_only }}" = "true" ]; then ARGS="$ARGS --status"; fi
+          if [ "${{ inputs.no_relay }}" = "true" ]; then ARGS="$ARGS --no-relay"; fi
+          python3 backup.py $ARGS
