@@ -42,12 +42,16 @@ def cfg():
     return os.environ.get("BACKUP_SRC", ""), os.environ.get("BACKUP_DST", "")
 
 
-def size(spec):
-    """rclone size --json -> (文件数, 字节)"""
+def size(spec, allow_missing=False):
+    """rclone size --json -> (文件数, 字节)。
+    allow_missing=True 时, 目标目录还不存在视为 (0,0) 而不是报错。"""
     p = subprocess.run(["rclone", "size", spec, "--json", "--retries", "3"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
-        raise RuntimeError("size 失败(%s): %s" % (spec, (p.stderr or "")[-150:]))
+        err = p.stderr or ""
+        if allow_missing and ("not found" in err.lower()):
+            return 0, 0
+        raise RuntimeError("size 失败(%s): %s" % (spec, err[-150:]))
     d = json.loads(p.stdout)
     return int(d.get("count", 0)), int(d.get("bytes", 0))
 
@@ -124,14 +128,14 @@ def main():
     log("源: 文件 %d, 合计 %.2f GB" % (sc, sb / 1073741824.0))
 
     if a.status:
-        dc, db = size(dst)
+        dc, db = size(dst, allow_missing=True)
         log("目标: 文件 %d, 合计 %.2f GB" % (dc, db / 1073741824.0))
         log("进度: %.2f%%  (缺 %d 个文件)" % (
             (db * 100.0 / sb) if sb else 100.0, max(0, sc - dc)))
         return 0
 
     rc = copy(src, dst, a.max_duration)
-    dc, db = size(dst)
+    dc, db = size(dst, allow_missing=True)
     pct = (db * 100.0 / sb) if sb else 100.0
     done = (dc >= sc) and (db >= sb)
     log("--- 本轮结束 ---")
