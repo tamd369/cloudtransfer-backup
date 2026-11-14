@@ -59,7 +59,8 @@ def size(spec, allow_missing=False):
 def copy(src, dst, max_duration):
     cmd = ["rclone", "copy", src, dst,
            "--transfers", "8", "--checkers", "8",
-           "--drive-chunk-size", "128M", "--drive-multi-thread-streams", "4",
+           "--drive-chunk-size", "128M",
+           "--multi-thread-streams", "4", "--multi-thread-cutoff", "100M",
            "--drive-acknowledge-abuse",
            "--onedrive-chunk-size", "100M",
            "--max-duration", max_duration,
@@ -134,18 +135,28 @@ def main():
             (db * 100.0 / sb) if sb else 100.0, max(0, sc - dc)))
         return 0
 
+    dc0, db0 = size(dst, allow_missing=True)     # 本轮开始前目标端
     rc = copy(src, dst, a.max_duration)
     dc, db = size(dst, allow_missing=True)
     pct = (db * 100.0 / sb) if sb else 100.0
     done = (dc >= sc) and (db >= sb)
+    progressed = (db > db0) or (dc > dc0)
     log("--- 本轮结束 ---")
     log("源 %d 个 / %.2f GB ; 目标 %d 个 / %.2f GB ; 进度 %.2f%%  rc=%d" % (
         sc, sb / 1073741824.0, dc, db / 1073741824.0, pct, rc))
+    log("本轮新增 %.2f GB" % ((db - db0) / 1073741824.0))
 
     if done:
         log("备份完成 ✅")
         tg("☁️ 备份完成\n文件 %d 个 / %.2f GB\n进度 100%%" % (dc, db / 1073741824.0))
         return 0
+
+    # 防死循环保险: rclone 报错且本轮零进展 -> 绝不自接力, 直接失败暴露问题。
+    # (旧版没这道闸, flag 写错时 rclone 秒退 rc=2, 于是每 13 秒自接力刷了一长串 run)
+    if rc != 0 and not progressed:
+        log("!! 本轮零进展且 rclone 返回 %d —— 不自接力, 直接失败以免死循环" % rc)
+        tg("❌ 备份失败: rclone rc=%d 且零进展, 已停止自接力, 需人工查看日志" % rc)
+        return 1
 
     log("尚未完成, 准备自接力")
     if not a.no_relay:
