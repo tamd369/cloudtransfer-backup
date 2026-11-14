@@ -1,0 +1,73 @@
+name: backup
+
+# 整份备份: 源远端目录 -> 目标远端目录(默认 gd6:out4 -> onedrive2:out4)
+#   - 增量 + 幂等: rclone copy 已存在且一致的文件自动跳过, 中断后重跑接着传
+#   - 单轮限时(默认 300m); 跑不完会"自接力"再起一轮, 直到 dst 追平 src
+#   - 真实盘名/目录名只存 Secret, 不回显(公开仓库)
+# Secrets: RCLONE_CONF(含源+目标两个远端) / BACKUP_JSON({"src":..,"dst":..}) /
+#          GH_TOKEN(自接力用) / TG_TOKEN / TG_CHAT_ID(可选通知)
+
+on:
+  schedule:
+    # 兜底: 每 2 小时检查一次(错峰到 :11), 真正推进靠自接力
+    - cron: "11 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      max_duration:
+        description: "本轮最长运行时间(rclone 语法, 如 300m / 4h)"
+        required: false
+        default: "300m"
+      status_only:
+        description: "true=只统计两端进度, 不传输"
+        required: false
+        default: "false"
+      no_relay:
+        description: "true=本轮结束不自接力"
+        required: false
+        default: "false"
+
+concurrency:
+  # 串行: 同一时刻只允许一轮在跑(排队而不是取消), 避免多轮互抢带宽
+  group: backup-serial
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          test -s ~/.config/rclone/rclone.conf && echo "配置已写入"
+          grep -E '^\[' ~/.config/rclone/rclone.conf | sed 's/$/: <masked>/'
+          df -h / | tail -1
+
+      - name: 备份(增量, 可反复重跑)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          BACKUP_JSON: ${{ secrets.BACKUP_JSON }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -e
+          ARGS="--max-duration ${{ inputs.max_duration || '300m' }}"
+          if [ "${{ inputs.status_only }}" = "true" ]; then ARGS="$ARGS --status"; fi
+          if [ "${{ inputs.no_relay }}" = "true" ]; then ARGS="$ARGS --no-relay"; fi
+          python3 backup.py $ARGS
