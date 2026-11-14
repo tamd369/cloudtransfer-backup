@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
-"""源目录 -> 目标远端 整份备份(增量, 可反复重跑)
+"""源目录 -> 目标远端 整份拷贝/备份(增量, 可反复重跑)
 
-配置来自 Secret BACKUP_JSON:  {"src":"gd6x:out4","dst":"onedrive2:out4"}
+两种配置来源(优先 JOBS_JSON):
+  JOBS_JSON = {"jobs": {"<任务名>": {"src":"gd6x:out5", "dst":"gd2:out5"}, ...}}
+      用 --job <任务名> 选一个
+  BACKUP_JSON = {"src":"...","dst":"..."}     (老格式, 不带 --job 时用)
+
 特性:
   - rclone copy 天然增量: 已存在且一致的文件自动跳过, 中断后重跑接着传
-  - 单轮限时(--max-duration), 跑不完会自动"自接力"再起一轮, 直到 dst 追平 src
-  - 幂等: 重复触发不会重复传
+  - 单轮限时(--max-duration), 跑不完自动"自接力"再起一轮(RELAY_WF 指定派发哪个 workflow)
+  - 防死循环: rclone 报错且本轮零进展 -> 绝不自接力, 直接失败
 
 用法:
-  python3 backup.py                     # 备份一轮(默认限时 300m)
-  python3 backup.py --max-duration 120m
-  python3 backup.py --status            # 只统计两端, 不传文件
-  python3 backup.py --no-relay          # 本轮结束不自接力
+  python3 backup.py                            # 老格式(BACKUP_JSON)
+  python3 backup.py --job out5-to-gd2          # 按任务名(JOBS_JSON)
+  python3 backup.py --job X --status           # 只统计两端
+  python3 backup.py --job X --max-duration 120m --no-relay
 """
 import argparse
 import json
@@ -22,7 +26,6 @@ import time
 import urllib.error
 import urllib.request
 
-WF = "backup.yml"
 API = "https://api.github.com"
 
 
@@ -30,26 +33,36 @@ def log(m):
     print("%s %s" % (time.strftime("%H:%M:%S"), m), flush=True)
 
 
-def cfg():
+def cfg(job):
+    """返回 (src, dst, 说明)"""
+    if job:
+        raw = os.environ.get("JOBS_JSON", "")
+        if not raw:
+            raise SystemExit("!! 给了 --job 但缺 JOBS_JSON")
+        data = json.loads(raw)
+        j = (data.get("jobs") or {}).get(job)
+        if not j:
+            raise SystemExit("!! JOBS_JSON 里没有任务 %r (可用: %s)" % (
+                job, ", ".join(sorted((data.get("jobs") or {}).keys()))))
+        return j.get("src", ""), j.get("dst", ""), job
     raw = os.environ.get("BACKUP_JSON", "")
     if raw:
         try:
             d = json.loads(raw)
             if d.get("src") and d.get("dst"):
-                return d["src"], d["dst"]
+                return d["src"], d["dst"], "BACKUP_JSON"
         except Exception:
             pass
-    return os.environ.get("BACKUP_SRC", ""), os.environ.get("BACKUP_DST", "")
+    return os.environ.get("BACKUP_SRC", ""), os.environ.get("BACKUP_DST", ""), "env"
 
 
 def size(spec, allow_missing=False):
-    """rclone size --json -> (文件数, 字节)。
-    allow_missing=True 时, 目标目录还不存在视为 (0,0) 而不是报错。"""
+    """rclone size --json -> (文件数, 字节)。allow_missing 时目标不存在视为 (0,0)。"""
     p = subprocess.run(["rclone", "size", spec, "--json", "--retries", "3"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
         err = p.stderr or ""
-        if allow_missing and ("not found" in err.lower()):
+        if allow_missing and ("not found" in err.lower() or "directory not found" in err.lower()):
             return 0, 0
         raise RuntimeError("size 失败(%s): %s" % (spec, err[-150:]))
     d = json.loads(p.stdout)
@@ -66,7 +79,7 @@ def copy(src, dst, max_duration):
            "--max-duration", max_duration,
            "--stats", "60s", "--stats-one-line",
            "--retries", "3", "--low-level-retries", "10"]
-    log("开始备份(%s -> %s, 限时 %s)" % ("SRC", "DST", max_duration))
+    log("开始拷贝(限时 %s)" % max_duration)
     p = subprocess.run(cmd, text=True)
     return p.returncode
 
@@ -79,8 +92,7 @@ def tg(text):
     import urllib.parse
     data = urllib.parse.urlencode({"chat_id": chat, "text": text[:3900],
                                    "disable_web_page_preview": "true"}).encode()
-    req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % tok,
-                                 data=data,
+    req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % tok, data=data,
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
         with urllib.request.urlopen(req, timeout=60) as x:
@@ -90,22 +102,21 @@ def tg(text):
         return False
 
 
-def relay():
-    """还有没传完的 -> 再派发一轮自己"""
+def relay(wf, inputs):
     tok = os.environ.get("GH_TOKEN", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     if not tok or not repo:
         log("!! 缺 GH_TOKEN/GITHUB_REPOSITORY, 无法自接力")
         return False
-    body = json.dumps({"ref": "main", "inputs": {}}).encode()
-    req = urllib.request.Request("%s/repos/%s/actions/workflows/%s/dispatches" % (API, repo, WF),
+    body = json.dumps({"ref": "main", "inputs": inputs or {}}).encode()
+    req = urllib.request.Request("%s/repos/%s/actions/workflows/%s/dispatches" % (API, repo, wf),
                                  data=body, method="POST",
                                  headers={"Authorization": "token " + tok, "User-Agent": "bk-relay",
                                           "Accept": "application/vnd.github+json",
                                           "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=60) as x:
-            log("已派发下一轮 (HTTP %s)" % x.status)
+            log("已派发下一轮 %s (HTTP %s)" % (wf, x.status))
             return True
     except urllib.error.HTTPError as e:
         log("!! 派发失败 HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:150]))
@@ -114,16 +125,17 @@ def relay():
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--job", default="", help="JOBS_JSON 里的任务名")
     ap.add_argument("--max-duration", default="300m")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--no-relay", action="store_true")
     a = ap.parse_args()
 
-    src, dst = cfg()
+    src, dst, tag = cfg(a.job)
     if not src or not dst:
-        log("!! 缺 BACKUP_JSON(src/dst)")
+        log("!! 缺 src/dst (检查 JOBS_JSON / BACKUP_JSON)")
         return 1
-    log("任务已载入(src/dst 来自 Secret, 不回显)")
+    log("任务 = %s" % tag)
 
     sc, sb = size(src)
     log("源: 文件 %d, 合计 %.2f GB" % (sc, sb / 1073741824.0))
@@ -135,7 +147,7 @@ def main():
             (db * 100.0 / sb) if sb else 100.0, max(0, sc - dc)))
         return 0
 
-    dc0, db0 = size(dst, allow_missing=True)     # 本轮开始前目标端
+    dc0, db0 = size(dst, allow_missing=True)
     rc = copy(src, dst, a.max_duration)
     dc, db = size(dst, allow_missing=True)
     pct = (db * 100.0 / sb) if sb else 100.0
@@ -147,20 +159,21 @@ def main():
     log("本轮新增 %.2f GB" % ((db - db0) / 1073741824.0))
 
     if done:
-        log("备份完成 ✅")
-        tg("☁️ 备份完成\n文件 %d 个 / %.2f GB\n进度 100%%" % (dc, db / 1073741824.0))
+        log("拷贝完成 ✅")
+        tg("☁️ 拷贝完成 [%s]\n文件 %d 个 / %.2f GB" % (tag, dc, db / 1073741824.0))
         return 0
 
-    # 防死循环保险: rclone 报错且本轮零进展 -> 绝不自接力, 直接失败暴露问题。
-    # (旧版没这道闸, flag 写错时 rclone 秒退 rc=2, 于是每 13 秒自接力刷了一长串 run)
+    # 防死循环: rclone 报错且零进展 -> 不自接力
     if rc != 0 and not progressed:
         log("!! 本轮零进展且 rclone 返回 %d —— 不自接力, 直接失败以免死循环" % rc)
-        tg("❌ 备份失败: rclone rc=%d 且零进展, 已停止自接力, 需人工查看日志" % rc)
+        tg("❌ 拷贝失败 [%s]: rclone rc=%d 且零进展, 已停止自接力" % (tag, rc))
         return 1
 
     log("尚未完成, 准备自接力")
     if not a.no_relay:
-        relay()
+        wf = os.environ.get("RELAY_WF", "backup.yml")
+        inputs = {"job": a.job} if a.job else {}
+        relay(wf, inputs)
     return 0
 
 
